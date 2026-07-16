@@ -391,6 +391,67 @@ parse_reverse_svc() {
     esac
 }
 
+# Extract the host (domain or IPv4) from a vless:// URL.
+url_host() {
+    local rest="${1#vless://}"; rest="${rest#*@}"
+    local hp="${rest%%\?*}"; hp="${hp%%\#*}"
+    printf '%s' "${hp%%:*}"
+}
+
+# Wire OS routing so traffic actually enters the TUN inbound, WITHOUT looping the
+# encrypted uplink back into it. Called after xray is started. All-or-nothing: on
+# any problem it changes nothing, so SOCKS/reverse keep working and TUN just stays
+# inert (a broken tun route must never take down the working paths).
+#   1. exclude the server/portal IPs (route them via the real default gateway),
+#      otherwise xray's own uplink re-enters tun0 -> loop -> everything dies;
+#   2. pull the rest into tun0 via 0.0.0.0/1 + 128.0.0.0/1 (more specific than the
+#      default route, so they win without having to remove it).
+setup_tun_routing() {
+    command -v ip >/dev/null 2>&1 || { log_error "TUN routing: no 'ip' tool"; return 1; }
+
+    # transparent proxy forwards packets from the LAN interface into tun0; without
+    # ip_forward=1 the captured packets would be silently dropped. Bail before adding
+    # any route so we degrade to SOCKS-only instead of blackholing the LAN.
+    echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
+    [ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" = "1" ] \
+        || { log_error "TUN routing: ip_forward is not 1 (cannot forward LAN into tun0)"; return 1; }
+
+    local def_gw def_if
+    def_gw=$(ip route show default 2>/dev/null | awk '/^default/{print $3; exit}')
+    def_if=$(ip route show default 2>/dev/null | awk '/^default/{print $5; exit}')
+    [ -n "$def_gw" ] && [ -n "$def_if" ] || { log_error "TUN routing: no default route"; return 1; }
+
+    local ips="" h ip dns_ips
+    for h in $VPN_HOST $REVERSE_HOST; do
+        case "$h" in
+            *[!0-9.]*) ip=$(getent ahostsv4 "$h" 2>/dev/null | awk '{print $1}' | sort -u) ;;
+            *)         ip="$h" ;;
+        esac
+        [ -n "$ip" ] || { log_error "TUN routing: cannot resolve '$h'"; return 1; }
+        ips="$ips $ip"
+    done
+    # DNS servers xray talks to directly must bypass the tunnel too, otherwise the
+    # bootstrap resolution can deadlock (it would need the not-yet-up tunnel).
+    if [ -n "$DNS_SERVERS" ]; then
+        dns_ips=$(printf '%s' "$DNS_SERVERS" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | sort -u)
+    else
+        dns_ips="8.8.8.8 77.88.8.8"
+    fi
+    ips="$ips $dns_ips"
+
+    local i=0
+    while [ "$i" -lt 40 ]; do ip link show tun0 >/dev/null 2>&1 && break; sleep 0.25; i=$((i + 1)); done
+    ip link show tun0 >/dev/null 2>&1 || { log_error "TUN routing: tun0 never came up"; return 1; }
+
+    for ip in $ips; do
+        ip route replace "$ip/32" via "$def_gw" dev "$def_if" 2>/dev/null \
+            || { log_error "TUN routing: exclude $ip failed"; return 1; }
+    done
+    ip route replace 0.0.0.0/1   dev tun0 2>/dev/null || { log_error "TUN routing: 0.0.0.0/1 failed"; return 1; }
+    ip route replace 128.0.0.0/1 dev tun0 2>/dev/null || { log_error "TUN routing: 128.0.0.0/1 failed"; return 1; }
+    log_info "TUN routing active (0.0.0.0/1+128.0.0.0/1 -> tun0; bypass via ${def_if}:${ips})"
+}
+
 # =============================================================================
 # Validate environment
 # =============================================================================
@@ -413,12 +474,14 @@ else
 fi
 
 log_info "VPN server: ${VPN_URL%%\?*}"
+VPN_HOST=$(url_host "$VPN_URL")
 
 # =============================================================================
 # Resolve reverse server URL (optional)
 # =============================================================================
 
 REVERSE_URL=""
+REVERSE_HOST=""
 if [ -n "$RSRV" ]; then
     REVERSE_URL=$(printf '%s' "$RSRV" | tr -d ' \n\r\t')
 elif [ -n "$RSUB" ]; then
@@ -427,6 +490,7 @@ fi
 
 if [ -n "$REVERSE_URL" ]; then
     log_info "Reverse portal: ${REVERSE_URL%%\?*}"
+    REVERSE_HOST=$(url_host "$REVERSE_URL")
     [ -z "$REVERSE_SERVICES" ] && die "REVERSE_SERVICES must be set when reverse is enabled"
 
     # Validate every entry up front (parse_reverse_svc dies on malformed specs).
@@ -673,4 +737,10 @@ log_info "Config written to $CONFIG_FILE"
 # =============================================================================
 
 log_info "Starting Xray-Core..."
-/usr/local/bin/xray run -c "$CONFIG_FILE"
+/usr/local/bin/xray run -c "$CONFIG_FILE" &
+XRAY_PID=$!
+# Forward container stop signals to xray for a clean shutdown (it now runs in the
+# background so we can set up TUN routing after it creates tun0).
+trap 'kill -TERM "$XRAY_PID" 2>/dev/null' TERM INT
+setup_tun_routing || log_error "TUN transparent proxy inactive (SOCKS/reverse unaffected)"
+wait "$XRAY_PID"
