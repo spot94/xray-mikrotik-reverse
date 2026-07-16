@@ -455,9 +455,16 @@ setup_tun_routing() {
         ip route replace "$net" via "$def_gw" dev "$def_if" 2>/dev/null \
             || { log_error "TUN routing: bypass $net failed"; return 1; }
     done
+    # Extra user-defined bypass routes (split tunneling): destinations listed in
+    # EXCLUDE_ROUTES leave via the physical gw instead of the tunnel. Accepts IPs
+    # and CIDRs, comma-separated (e.g. "1.1.1.1,192.0.2.0/24").
+    for net in $(printf '%s' "$EXCLUDE_ROUTES" | tr ',' ' '); do
+        ip route replace "$net" via "$def_gw" dev "$def_if" 2>/dev/null \
+            || { log_error "TUN routing: bypass $net (EXCLUDE_ROUTES) failed"; return 1; }
+    done
     ip route replace 0.0.0.0/1   dev tun0 2>/dev/null || { log_error "TUN routing: 0.0.0.0/1 failed"; return 1; }
     ip route replace 128.0.0.0/1 dev tun0 2>/dev/null || { log_error "TUN routing: 128.0.0.0/1 failed"; return 1; }
-    log_info "TUN routing active (0.0.0.0/1+128.0.0.0/1 -> tun0; bypass via ${def_if}:${ips})"
+    log_info "TUN routing active (0.0.0.0/1+128.0.0.0/1 -> tun0; bypass via ${def_if}: private ranges,${ips}${EXCLUDE_ROUTES:+, $EXCLUDE_ROUTES})"
 }
 
 # =============================================================================
@@ -469,6 +476,7 @@ setup_tun_routing() {
 SERVER_INDEX="${SERVER_INDEX:-0}"
 LOG_LEVEL="${LOG_LEVEL:-warning}"
 DNS_SERVERS="${DNS_SERVERS:-}"
+EXCLUDE_ROUTES="${EXCLUDE_ROUTES:-}"
 
 # =============================================================================
 # Resolve VPN server URL
