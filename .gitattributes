@@ -1,0 +1,4 @@
+# Enforce LF line endings. The shell scripts and Dockerfile run on Linux and
+# break with CRLF (e.g. "#!/bin/sh\r: bad interpreter"), so never let a Windows
+# checkout introduce CRLF.
+* text=auto eol=lf

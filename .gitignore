@@ -1,0 +1,9 @@
+# Build artifacts (image export is large; build it, don't commit it)
+*.tar
+
+# Local Claude Code settings
+.claude/
+
+# OS junk
+.DS_Store
+Thumbs.db

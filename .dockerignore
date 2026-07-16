@@ -1,0 +1,7 @@
+*.tar
+*.md
+build.sh
+.git
+.gitignore
+.github
+.claude
