@@ -447,6 +447,14 @@ setup_tun_routing() {
         ip route replace "$ip/32" via "$def_gw" dev "$def_if" 2>/dev/null \
             || { log_error "TUN routing: exclude $ip failed"; return 1; }
     done
+    # Keep LAN / private-range traffic OFF the tunnel. The 0/1+128/1 capture below is
+    # greedy: without these, replies to LAN clients (SOCKS/TUN return path) and reverse
+    # deliveries to local services get swallowed into tun0 and lost. Only public
+    # destinations should be proxied; private ranges route back via the physical gw.
+    for net in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16; do
+        ip route replace "$net" via "$def_gw" dev "$def_if" 2>/dev/null \
+            || { log_error "TUN routing: bypass $net failed"; return 1; }
+    done
     ip route replace 0.0.0.0/1   dev tun0 2>/dev/null || { log_error "TUN routing: 0.0.0.0/1 failed"; return 1; }
     ip route replace 128.0.0.0/1 dev tun0 2>/dev/null || { log_error "TUN routing: 128.0.0.0/1 failed"; return 1; }
     log_info "TUN routing active (0.0.0.0/1+128.0.0.0/1 -> tun0; bypass via ${def_if}:${ips})"
