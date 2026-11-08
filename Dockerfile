@@ -1,6 +1,6 @@
 FROM alpine:3.19
 
-ARG XRAY_VERSION=v26.6.27
+ARG XRAY_VERSION=v26.10.31
 ARG TARGETPLATFORM
 
 RUN apk add --no-cache ca-certificates curl tzdata jq
@@ -12,7 +12,7 @@ RUN adduser -D -s /sbin/nologin xray || true
 RUN case "$TARGETPLATFORM" in \
     "linux/amd64")  ARCH="64" ;; \
     "linux/arm64")  ARCH="arm64-v8a" ;; \
-    "linux/arm/v7") ARCH="armv7a" ;; \
+    "linux/arm/v7") ARCH="arm32-v7a" ;; \
     *)              ARCH="64" ;; \
     esac && \
     curl -L -o /tmp/xray.zip \
@@ -20,7 +20,7 @@ RUN case "$TARGETPLATFORM" in \
     unzip /tmp/xray.zip -d /usr/local/bin/ && \
     rm /tmp/xray.zip && \
     chmod +x /usr/local/bin/xray && \
-    mkdir -p /etc/xray /var/log/xray
+    mkdir -p /etc/xray
 
 COPY --chmod=755 entrypoint.sh /entrypoint.sh
 

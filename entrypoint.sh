@@ -2,8 +2,11 @@
 set -e
 
 CONFIG_FILE="/etc/xray/config.json"
-LOG_FILE="/var/log/xray/access.log"
-ERROR_FILE="/var/log/xray/error.log"
+
+# SO_MARK put on every socket xray dials + the policy-routing table that sends
+# marked traffic past tun0 (see setup_mark_bypass).
+XRAY_MARK=255
+BYPASS_TABLE=101
 
 # =============================================================================
 # Helper functions
@@ -398,12 +401,39 @@ url_host() {
     printf '%s' "${hp%%:*}"
 }
 
+# True if the process has CAP_NET_ADMIN (bit 12 of CapEff). SO_MARK requires it.
+has_net_admin() {
+    local capeff
+    capeff=$(awk '/^CapEff:/{print $2}' /proc/self/status 2>/dev/null)
+    [ -n "$capeff" ] && [ $(( 0x$capeff >> 12 & 1 )) -eq 1 ]
+}
+
+# Policy routing for xray's own sockets: everything carrying XRAY_MARK is routed
+# by BYPASS_TABLE (physical default gw + on-link subnets), so it can never enter
+# tun0 — whatever IP the server resolves to now or later (DNS change, CDN,
+# round-robin). The static /32 excludes in setup_tun_routing remain as a fallback
+# for when this is unavailable. Idempotent across container restarts.
+# Args: $1=default gw $2=default interface
+setup_mark_bypass() {
+    [ "$XRAY_MARK_ENABLED" = 1 ] || return 1
+    while ip rule del fwmark "$XRAY_MARK" table "$BYPASS_TABLE" priority 100 2>/dev/null; do :; done
+    ip route flush table "$BYPASS_TABLE" 2>/dev/null || true
+    ip route replace default via "$1" dev "$2" table "$BYPASS_TABLE" 2>/dev/null || return 1
+    # On-link subnets (veth etc.), so marked traffic to a neighbour isn't hairpinned via gw.
+    ip route show scope link 2>/dev/null | while read -r dst _ dev _; do
+        [ "$dst" = default ] || [ "$dev" = tun0 ] && continue
+        ip route replace "$dst" dev "$dev" table "$BYPASS_TABLE" 2>/dev/null || true
+    done
+    ip rule add fwmark "$XRAY_MARK" table "$BYPASS_TABLE" priority 100 2>/dev/null || return 1
+}
+
 # Wire OS routing so traffic actually enters the TUN inbound, WITHOUT looping the
 # encrypted uplink back into it. Called after xray is started. All-or-nothing: on
 # any problem it changes nothing, so SOCKS/reverse keep working and TUN just stays
 # inert (a broken tun route must never take down the working paths).
-#   1. exclude the server/portal IPs (route them via the real default gateway),
-#      otherwise xray's own uplink re-enters tun0 -> loop -> everything dies;
+#   1. keep xray's own uplink out of tun0, otherwise it re-enters tun0 -> loop ->
+#      everything dies: its sockets are fwmarked and policy-routed past tun0
+#      (setup_mark_bypass), plus the server/portal/DNS IPs are excluded statically;
 #   2. pull the rest into tun0 via 0.0.0.0/1 + 128.0.0.0/1 (more specific than the
 #      default route, so they win without having to remove it).
 setup_tun_routing() {
@@ -412,7 +442,7 @@ setup_tun_routing() {
     # transparent proxy forwards packets from the LAN interface into tun0; without
     # ip_forward=1 the captured packets would be silently dropped. Bail before adding
     # any route so we degrade to SOCKS-only instead of blackholing the LAN.
-    echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
+    { echo 1 > /proc/sys/net/ipv4/ip_forward; } 2>/dev/null || true
     [ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" = "1" ] \
         || { log_error "TUN routing: ip_forward is not 1 (cannot forward LAN into tun0)"; return 1; }
 
@@ -432,12 +462,16 @@ setup_tun_routing() {
     done
     # DNS servers xray talks to directly must bypass the tunnel too, otherwise the
     # bootstrap resolution can deadlock (it would need the not-yet-up tunnel).
-    if [ -n "$DNS_SERVERS" ]; then
-        dns_ips=$(printf '%s' "$DNS_SERVERS" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | sort -u)
-    else
-        dns_ips="8.8.8.8 77.88.8.8"
-    fi
-    ips="$ips $dns_ips"
+    # The system resolver (/etc/resolv.conf) is ALWAYS involved: xray resolves the
+    # server domain for its own dials through it (unmarked Go resolver sockets),
+    # and with DNS_SERVERS unset it's also xray's DNS ("localhost"). Loopback
+    # resolvers (e.g. Docker's 127.0.0.11) never touch routing and are skipped.
+    dns_ips=$( {
+        awk '$1 == "nameserver" {print $2}' /etc/resolv.conf 2>/dev/null
+        printf '%s' "$DNS_SERVERS" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}'
+    } | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | grep -v '^127\.' | sort -u)
+    ips=$(printf '%s\n' $ips $dns_ips | sort -u | tr '\n' ' ')
+    ips="${ips% }"
 
     local i=0
     while [ "$i" -lt 40 ]; do ip link show tun0 >/dev/null 2>&1 && break; sleep 0.25; i=$((i + 1)); done
@@ -447,6 +481,13 @@ setup_tun_routing() {
         ip route replace "$ip/32" via "$def_gw" dev "$def_if" 2>/dev/null \
             || { log_error "TUN routing: exclude $ip failed"; return 1; }
     done
+    # Not fatal: without it we still have the static excludes above (as before),
+    # only a later change of the server IP would no longer be covered.
+    local mark_state="on"
+    setup_mark_bypass "$def_gw" "$def_if" || {
+        mark_state="off"
+        log_error "TUN routing: fwmark bypass unavailable; relying on static excludes (a server IP change would loop)"
+    }
     # Keep LAN / private-range traffic OFF the tunnel. The 0/1+128/1 capture below is
     # greedy: without these, replies to LAN clients (SOCKS/TUN return path) and reverse
     # deliveries to local services get swallowed into tun0 and lost. Only public
@@ -464,7 +505,7 @@ setup_tun_routing() {
     done
     ip route replace 0.0.0.0/1   dev tun0 2>/dev/null || { log_error "TUN routing: 0.0.0.0/1 failed"; return 1; }
     ip route replace 128.0.0.0/1 dev tun0 2>/dev/null || { log_error "TUN routing: 128.0.0.0/1 failed"; return 1; }
-    log_info "TUN routing active (0.0.0.0/1+128.0.0.0/1 -> tun0; bypass via ${def_if}: private ranges,${ips}${EXCLUDE_ROUTES:+, $EXCLUDE_ROUTES})"
+    log_info "TUN routing active (0.0.0.0/1+128.0.0.0/1 -> tun0; xray fwmark bypass: ${mark_state}; bypass via ${def_if}: private ranges,${ips}${EXCLUDE_ROUTES:+, $EXCLUDE_ROUTES})"
 }
 
 # =============================================================================
@@ -477,6 +518,7 @@ SERVER_INDEX="${SERVER_INDEX:-0}"
 LOG_LEVEL="${LOG_LEVEL:-warning}"
 DNS_SERVERS="${DNS_SERVERS:-}"
 EXCLUDE_ROUTES="${EXCLUDE_ROUTES:-}"
+ACCESS_LOG="${ACCESS_LOG:-}"
 
 # =============================================================================
 # Resolve VPN server URL
@@ -568,6 +610,18 @@ if [ -n "$REVERSE_URL" ] && [ -n "$REVERSE_SERVICES" ]; then
         OUTBOUNDS=$(echo "$OUTBOUNDS" | jq --argjson o "$local_out" '. + [$o]')
     done
     IFS="$old_ifs"
+fi
+
+# Mark every socket xray dials (sockopt.mark -> SO_MARK) so setup_mark_bypass can
+# policy-route xray's own traffic past tun0. SO_MARK needs CAP_NET_ADMIN (which
+# TUN needs anyway); without it every dial would fail, so only mark when we have it.
+if has_net_admin; then
+    XRAY_MARK_ENABLED=1
+    OUTBOUNDS=$(echo "$OUTBOUNDS" | jq --argjson m "$XRAY_MARK" \
+        'map(.streamSettings = ((.streamSettings // {}) | .sockopt = ((.sockopt // {}) + {mark: $m})))')
+else
+    XRAY_MARK_ENABLED=0
+    log_error "No CAP_NET_ADMIN: xray sockets left unmarked (fwmark bypass off)"
 fi
 
 # =============================================================================
@@ -700,13 +754,22 @@ ROUTING_RULES=$(echo "$ROUTING_RULES" | jq --argjson r "$PROXY_RULE" '. + [$r]')
 # Assemble final config
 # =============================================================================
 
+# Logs go to stdout (error: "") so they show up in the container log (Mikrotik:
+# logging=yes) instead of piling up as files on the router's flash. The access
+# log writes a line per connection at ANY loglevel, so it's off unless asked for.
+case "$ACCESS_LOG" in
+    1|true|yes|on) XRAY_ACCESS_LOG="" ;;      # "" = stdout
+    *)             XRAY_ACCESS_LOG="none" ;;
+esac
+
 CONFIG=$(jq -n \
     --arg loglevel "$LOG_LEVEL" \
+    --arg access "$XRAY_ACCESS_LOG" \
     --argjson inbounds "$INBOUNDS" \
     --argjson outbounds "$OUTBOUNDS" \
     --argjson rules "$ROUTING_RULES" \
     '{
-        log: { loglevel: $loglevel, access: "/var/log/xray/access.log", error: "/var/log/xray/error.log" },
+        log: { loglevel: $loglevel, access: $access, error: "" },
         inbounds: $inbounds,
         outbounds: $outbounds,
         routing: { domainStrategy: "IPIfNonMatch", rules: $rules },

@@ -33,7 +33,8 @@
 | `SOCKS_PORT` | Нет | Порт SOCKS5 (если не задан — SOCKS выключен) |
 | `SOCKS_USER` | Нет | Пользователь SOCKS5 (только с SOCKS_PORT) |
 | `SOCKS_PASSWORD` | Нет | Пароль SOCKS5 (только с SOCKS_PORT) |
-| `LOG_LEVEL` | Нет | Уровень логов Xray: `debug`/`info`/`warning`/`error` (по умолчанию `warning`) |
+| `LOG_LEVEL` | Нет | Уровень логов Xray: `debug`/`info`/`warning`/`error` (по умолчанию `warning`). Логи идут в stdout контейнера (на Mikrotik — `logging=yes`), файлов на флеше не создаётся |
+| `ACCESS_LOG` | Нет | `1`/`true` — включить access-лог Xray (строка на каждое соединение, в stdout). По умолчанию выключен |
 | `DNS_SERVERS` | Нет | DNS-серверы через запятую. Если не задан — используется DNS самого контейнера (системный резолвер `/etc/resolv.conf`, задаётся настройками контейнера). Плоские IP-серверы из этого списка резолвятся напрямую, минуя туннель |
 | `EXCLUDE_ROUTES` | Нет | Доп. маршруты (IP/CIDR через запятую), которые нужно исключить из TUN-туннеля (split tunneling) — пойдут через физический шлюз, минуя прокси. Напр. `1.1.1.1,192.0.2.0/24`. Дополняет исключения по умолчанию (сервер, DNS, приватные диапазоны) |
 
@@ -76,12 +77,12 @@ Freedom-outbound **без `redirect`**: пересылает на адрес н�
 
 При старте контейнер сам настраивает маршрутизацию, чтобы трафик реально попадал в `tun0`, **не зацикливая** собственный зашифрованный аплинк:
 
-1. IP сервера/портала и IP DNS-серверов исключаются (маршрутизируются через физический шлюз) — иначе исходящее соединение самого Xray снова уйдёт в `tun0` и всё ляжет петлёй;
+1. собственный трафик Xray не должен попасть в `tun0` — иначе он уйдёт туда снова и всё ляжет петлёй. Все сокеты Xray помечаются (`sockopt.mark` = 255), и правило `ip rule fwmark 255 → table 101` отправляет их через физический шлюз **при любом IP назначения** — смена IP сервера (DNS, CDN, round-robin) петлю не вызовет. Дополнительно (и как запасной вариант, если policy routing недоступен) IP сервера/портала и DNS-серверов — из `/etc/resolv.conf` и `DNS_SERVERS` — исключаются статически;
 2. приватные диапазоны (`10/8`, `172.16/12`, `192.168/16`) тоже исключаются — иначе перехват «съедает» обратку к LAN-клиентам (ответ SOCKS/TUN) и доставку reverse в локальные сервисы; в туннель идёт только публичный трафик;
 3. дополнительные маршруты из `EXCLUDE_ROUTES` (если задан) исключаются так же — удобно для split tunneling (например, отдать какой-то сервис в обход прокси);
 4. остальное заворачивается в `tun0` через `0.0.0.0/1` + `128.0.0.0/1` (более специфичны, чем default — побеждают, не удаляя его).
 
-Логика **всё-или-ничего**: при любой проблеме (нет `tun0`, не удалось включить `ip_forward`, не резолвится хост) маршруты **не трогаются вообще** — SOCKS5 и reverse продолжают работать, а TUN просто остаётся неактивным. В логе будет `TUN routing active ...` при успехе либо `TUN transparent proxy inactive` при деградации.
+Логика **всё-или-ничего**: при любой проблеме (нет `tun0`, не удалось включить `ip_forward`, не резолвится хост) маршруты **не трогаются вообще** — SOCKS5 и reverse продолжают работать, а TUN просто остаётся неактивным. В логе будет `TUN routing active ...` при успехе либо `TUN transparent proxy inactive` при деградации. В строке `TUN routing active` видно `xray fwmark bypass: on|off` — `off` значит, что policy routing недоступен и работает только статическое исключение IP.
 
 > **Требование:** контейнеру нужен `ip_forward=1` (форвардит трафик LAN в `tun0`). Контейнер выставляет его сам; на Mikrotik с обычными правами контейнера это проходит. Если среда запрещает запись в `/proc/sys` и значение осталось `0` — TUN не активируется (SOCKS/reverse не затрагиваются).
 
@@ -90,6 +91,9 @@ Freedom-outbound **без `redirect`**: пересылает на адрес н�
 ```bash
 # Для Mikrotik hAP ax²/ax³ (arm64)
 docker buildx build --platform linux/arm64 -t xray-mikrotik:arm64 .
+
+# Для 32-битных ARM (hAP ac², RB4011 и т.п.)
+docker buildx build --platform linux/arm/v7 -t xray-mikrotik:armv7 .
 
 # Экспорт для Mikrotik Container
 docker save xray-mikrotik:arm64 > xray-mikrotik.tar
@@ -118,16 +122,18 @@ docker save xray-mikrotik:arm64 > xray-mikrotik.tar
 /container/envs/add name=xray-env key=SOCKS_PORT value="1080"
 
 # Добавить контейнер — источник образа согласно выбору выше:
-#   A) из GHCR (можно и :latest, и пин версии Xray, напр. :26.6.27):
+#   A) из GHCR (можно и :latest, и пин версии Xray, напр. :26.10.31):
 /container/add \
   remote-image=<owner>/xray-mikrotik:latest \
   interface=veth-xray \
   root-dir=disk1/xray \
-  envlist=xray-env
+  envlist=xray-env \
+  logging=yes
 #   B) из локального .tar:
 # /container/add \
 #   file=disk1/xray-mikrotik.tar \
-#   interface=veth-xray root-dir=disk1/xray envlist=xray-env
+#   interface=veth-xray root-dir=disk1/xray envlist=xray-env logging=yes
+# logging=yes выводит логи контейнера (entrypoint + Xray) в /log роутера
 
 # Маршрутизация трафика в контейнер (пример)
 /ip/route/add dst-address=0.0.0.0/0 gateway=172.17.0.2 routing-mark=via-xray

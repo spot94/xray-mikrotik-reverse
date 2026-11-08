@@ -2,7 +2,7 @@
 set -e
 
 IMAGE_NAME="${IMAGE_NAME:-xray-mikrotik}"
-XRAY_VERSION="${XRAY_VERSION:-v26.6.27}"
+XRAY_VERSION="${XRAY_VERSION:-v26.10.31}"
 PLATFORM="${PLATFORM:-linux/arm64}"
 
 echo "=== Building Xray-Core Container ==="
